@@ -1,0 +1,813 @@
+// Copyright (c) Tailscale Inc & contributors
+// SPDX-License-Identifier: BSD-3-Clause
+
+// rogitproxy is a git protocol proxy that allows read-only access to git
+// repositories over the git:// protocol on a tailnet. It proxies to an HTTPS or
+// SSH backend (e.g. GitHub) and enforces access control based on tailnet
+// grants.
+//
+// The main use case is allowing sandboxed VMs access to private repositories
+// without exposing HTTPS credentials or SSH keys in the sandbox environment.
+package main
+
+import (
+	"bufio"
+	"bytes"
+	"context"
+	"encoding/hex"
+	"encoding/json"
+	"flag"
+	"fmt"
+	"io"
+	"log"
+	"net"
+	"net/http"
+	"net/url"
+	"os"
+	"os/exec"
+	"strings"
+
+	"tailscale.com/client/local"
+	"tailscale.com/client/tailscale/apitype"
+	"tailscale.com/tailcfg"
+	"tailscale.com/tsnet"
+	"tailscale.com/tsweb"
+)
+
+func main() {
+	var (
+		dev      = flag.Bool("dev", false, "listen on localhost instead of tsnet (for testing)")
+		backend  = flag.String("backend", "https://github.com", "backend git server URL (https://... or ssh://[user@]host[:port])")
+		hostname = flag.String("hostname", "rogitproxy", "tsnet hostname")
+		setecURL = flag.String("setec-url", "", "setec server URL for fetching secrets (e.g. https://secrets.your-tailnet.ts.net)")
+	)
+	flag.Parse()
+
+	proxy := &GitProxy{Backend: *backend}
+
+	var (
+		ln  net.Listener
+		srv *tsnet.Server
+		err error
+	)
+
+	if *dev {
+		ln, err = net.Listen("tcp", "localhost:0")
+		if err != nil {
+			log.Fatal(err)
+		}
+		fmt.Fprintf(os.Stderr, "dev mode: listening on %s\n", ln.Addr())
+	} else {
+		srv = &tsnet.Server{
+			Hostname: *hostname,
+		}
+		defer srv.Close()
+		ln, err = srv.Listen("tcp", ":9418")
+		if err != nil {
+			log.Fatal(err)
+		}
+		log.Printf("tsnet: listening as %s:9418", *hostname)
+	}
+
+	if srv != nil {
+		lc, err := srv.LocalClient()
+		if err != nil {
+			log.Fatalf("LocalClient: %v", err)
+		}
+		proxy.LocalClient = lc
+	}
+
+	_, keyOnDisk := getGitHubAppPrivateKeyFromDisk()
+	useGitHubTokenToBackend := *backend == "https://github.com" && (keyOnDisk || !*dev)
+
+	if useGitHubTokenToBackend {
+		var setecDo func(*http.Request) (*http.Response, error)
+		if srv != nil {
+			setecDo = srv.HTTPClient().Do
+		}
+		tr, err := GitHubAppTransport(context.Background(), *setecURL, setecDo)
+		if err != nil {
+			log.Fatalf("github app auth: %v", err)
+		}
+		proxy.HTTPClient = &http.Client{Transport: tr}
+		if srv != nil {
+			proxy.RequireGrants = true
+		}
+		log.Printf("github app auth enabled (app %d, installation %d)", *gitHubAppID, *gitHubInstallationID)
+	}
+
+	// Start HTTP debug/status server.
+	mux := http.NewServeMux()
+	tsweb.Debugger(mux)
+	mux.HandleFunc("/", proxy.serveIndex)
+
+	if *dev {
+		httpLn, err := net.Listen("tcp", "localhost:0")
+		if err != nil {
+			log.Fatal(err)
+		}
+		fmt.Fprintf(os.Stderr, "dev mode: http on %s\n", httpLn.Addr())
+		go http.Serve(httpLn, mux)
+	} else {
+		httpLn, err := srv.Listen("tcp", ":80")
+		if err != nil {
+			log.Fatalf("listen :80: %v", err)
+		}
+		go http.Serve(httpLn, mux)
+	}
+
+	log.Fatal(proxy.Serve(ln))
+}
+
+const grantCap tailcfg.PeerCapability = "github.com/tailscale/rogitproxy"
+
+// AccessType is the type of access granted to a repository.
+type AccessType string
+
+// AccessPull is the grant access type for read-only git operations,
+// including clone, fetch, ls-remote, and any other operation that
+// only reads from the repository (git-upload-pack).
+const AccessPull AccessType = "pull"
+
+// grantValue is the JSON structure of each grant value for the
+// rogitproxy capability, as defined in the tailnet ACL policy.
+type grantValue struct {
+	Repos  []string   `json:"repos"`  // e.g. ["tailscale/corp", "tailscale/tailscale"]
+	Access AccessType `json:"access"` // e.g. "pull"
+}
+
+// Logf is a printf-style logging function.
+type Logf func(format string, args ...any)
+
+// GitProxy proxies git:// protocol connections to an HTTPS or SSH backend.
+// It only permits read-only operations (git-upload-pack).
+type GitProxy struct {
+	Backend       string        // backend URL: "https://github.com" or "ssh://git@github.com"
+	HTTPClient    *http.Client  // optional; defaults to http.DefaultClient
+	LocalClient   *local.Client // optional; if set, used for WhoIs lookups to log caller identity
+	RequireGrants bool          // if true, enforce tailnet grants for repo access
+	Logf          Logf          // optional; defaults to log.Printf
+	ExtraSSHArgs  []string      // optional; extra args passed to ssh before the host (e.g. for tests)
+}
+
+func (p *GitProxy) logf(format string, args ...any) {
+	if p.Logf != nil {
+		p.Logf(format, args...)
+	} else {
+		log.Printf(format, args...)
+	}
+}
+
+func (p *GitProxy) httpClient() *http.Client {
+	if p.HTTPClient != nil {
+		return p.HTTPClient
+	}
+	return http.DefaultClient
+}
+
+// httpGet performs an HTTP GET with an explicit Accept header set so the
+// ghinstallation transport doesn't inject "application/vnd.github.v3+json"
+// which confuses GitHub's git smart HTTP endpoints.
+func (p *GitProxy) httpGet(ctx context.Context, url string) (*http.Response, error) {
+	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Accept", "*/*")
+	return p.httpClient().Do(req)
+}
+
+// httpPost performs an HTTP POST with the given content type and body,
+// setting an explicit Accept header for the same reason as httpGet.
+func (p *GitProxy) httpPost(ctx context.Context, url, contentType string, body io.Reader) (*http.Response, error) {
+	req, err := http.NewRequestWithContext(ctx, "POST", url, body)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", contentType)
+	req.Header.Set("Accept", "application/x-git-upload-pack-result")
+	return p.httpClient().Do(req)
+}
+
+func (p *GitProxy) isSSH() bool {
+	return strings.HasPrefix(p.Backend, "ssh://")
+}
+
+func (p *GitProxy) Serve(ln net.Listener) error {
+	for {
+		conn, err := ln.Accept()
+		if err != nil {
+			return err
+		}
+		go p.handleConn(conn)
+	}
+}
+
+func (p *GitProxy) handleConn(conn net.Conn) {
+	defer conn.Close()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	br := bufio.NewReader(conn)
+
+	// Read the initial request pkt-line.
+	// Format: "git-upload-pack /repo\0host=hostname\0"
+	line, err := readPktLine(br)
+	if err != nil {
+		p.logf("gitproxy: reading request: %v", err)
+		return
+	}
+	if line == nil {
+		return
+	}
+
+	// Split on NUL: [command+path, host=..., extras...]
+	parts := bytes.SplitN(line, []byte{0}, 3)
+	cmdPath := string(parts[0])
+	spaceIdx := strings.IndexByte(cmdPath, ' ')
+	if spaceIdx < 0 {
+		sendError(conn, "invalid request")
+		return
+	}
+	cmd := cmdPath[:spaceIdx]
+	repoPath := cmdPath[spaceIdx+1:]
+
+	if cmd != "git-upload-pack" {
+		counterNumDenied.Add(1)
+		sendError(conn, "permission denied: only read-only (fetch/clone) operations are allowed")
+		return
+	}
+
+	counterNumRequests.Add(1)
+
+	who := p.whoIs(conn)
+	whoStr := formatWhoIs(conn, who)
+
+	if p.RequireGrants {
+		if who == nil {
+			counterNumDenied.Add(1)
+			sendError(conn, "access denied: unable to identify peer")
+			p.logf("gitproxy: denied %s to %s: no WhoIs", repoPath, whoStr)
+			return
+		}
+		// Normalize "/tailscale/corp.git" to "tailscale/corp".
+		repo := strings.TrimPrefix(repoPath, "/")
+		repo = strings.TrimSuffix(repo, ".git")
+		if !checkGrant(who, repo, AccessPull) {
+			counterNumDenied.Add(1)
+			sendError(conn, fmt.Sprintf("access denied: no grant for %s", repoPath))
+			p.logf("gitproxy: denied %s to %s: no grant", repoPath, whoStr)
+			return
+		}
+	}
+
+	if p.isSSH() {
+		p.logf("gitproxy: connect %s by %s", repoPath, whoStr)
+		p.handleSSH(ctx, conn, br, repoPath)
+	} else {
+		p.logf("gitproxy: request %s by %s", repoPath, whoStr)
+		p.handleHTTPS(ctx, conn, br, repoPath, whoStr)
+	}
+}
+
+// whoIs returns the WhoIs response for the remote peer, or nil if
+// LocalClient is not configured or the lookup fails.
+func (p *GitProxy) whoIs(conn net.Conn) *apitype.WhoIsResponse {
+	if p.LocalClient == nil {
+		return nil
+	}
+	who, err := p.LocalClient.WhoIs(context.Background(), conn.RemoteAddr().String())
+	if err != nil {
+		return nil
+	}
+	return who
+}
+
+// formatWhoIs returns a human-readable string for the peer.
+func formatWhoIs(conn net.Conn, who *apitype.WhoIsResponse) string {
+	addr := conn.RemoteAddr().String()
+	if who == nil {
+		return addr
+	}
+	user := who.UserProfile.LoginName
+	node := strings.TrimSuffix(who.Node.Name, ".")
+	if user != "" && node != "" {
+		return user + " (" + node + ")"
+	}
+	if user != "" {
+		return user
+	}
+	if node != "" {
+		return node
+	}
+	return addr
+}
+
+// checkGrant checks whether the peer identified by who has a grant
+// allowing the given access type (e.g. AccessPull) to the given repo.
+// The repo is of the form "org/repo" (e.g. "tailscale/corp").
+// Only grants matching the requested access type are considered.
+func checkGrant(who *apitype.WhoIsResponse, repo string, access AccessType) bool {
+	for _, raw := range who.CapMap[grantCap] {
+		var g grantValue
+		if err := json.Unmarshal([]byte(raw), &g); err != nil {
+			continue
+		}
+		if g.Access != access {
+			continue
+		}
+		for _, allowed := range g.Repos {
+			if strings.EqualFold(allowed, repo) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// handleSSH proxies via SSH. Since SSH runs git-upload-pack on the remote,
+// the wire protocol is identical to git:// — we just pipe the bidirectional
+// stream. No capability stripping or shallow workarounds needed.
+func (p *GitProxy) handleSSH(ctx context.Context, conn net.Conn, br *bufio.Reader, repoPath string) {
+	u, err := url.Parse(p.Backend)
+	if err != nil {
+		sendError(conn, fmt.Sprintf("invalid backend URL: %v", err))
+		return
+	}
+
+	remotePath := strings.TrimRight(u.Path, "/") + repoPath
+
+	var args []string
+	args = append(args, p.ExtraSSHArgs...)
+	if port := u.Port(); port != "" {
+		args = append(args, "-p", port)
+	}
+	userHost := u.Hostname()
+	if user := u.User.Username(); user != "" {
+		userHost = user + "@" + userHost
+	}
+	args = append(args, userHost, "git-upload-pack", remotePath)
+
+	sshCmd := exec.CommandContext(ctx, "ssh", args...)
+	sshCmd.Stdin = br
+	sshCmd.Stdout = conn
+	var stderr bytes.Buffer
+	sshCmd.Stderr = &stderr
+
+	if err := sshCmd.Run(); err != nil {
+		if stderr.Len() > 0 {
+			p.logf("gitproxy: ssh git-upload-pack: %v: %s", err, stderr.Bytes())
+		}
+		// Don't log exit status 128 — that's normal when the client
+		// disconnects after ls-remote (broken pipe on the remote).
+		if exitErr, ok := err.(*exec.ExitError); ok && exitErr.ExitCode() == 128 {
+			return
+		}
+		if stderr.Len() == 0 {
+			p.logf("gitproxy: ssh git-upload-pack: %v", err)
+		}
+	}
+}
+
+// handleHTTPS proxies via the git smart HTTP protocol. This requires
+// bridging the interactive git:// protocol to HTTP's request/response
+// model: we strip multi-round negotiation capabilities and handle
+// the shallow protocol specially.
+func (p *GitProxy) handleHTTPS(ctx context.Context, conn net.Conn, br *bufio.Reader, repoPath, whoStr string) {
+	backendBase := strings.TrimRight(p.Backend, "/")
+
+	// Fetch ref advertisement from HTTPS backend.
+	refsURL := backendBase + repoPath + "/info/refs?service=git-upload-pack"
+	resp, err := p.httpGet(ctx, refsURL)
+	if err != nil {
+		sendError(conn, fmt.Sprintf("backend error: %v", err))
+		return
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		p.logf("gitproxy: backend %s returned %d: %s", refsURL, resp.StatusCode, body)
+		sendError(conn, fmt.Sprintf("repository not found or unavailable (HTTP %d)", resp.StatusCode))
+		return
+	}
+
+	refsBuf := bufio.NewReader(resp.Body)
+
+	// Smart HTTP ref response starts with "# service=git-upload-pack\n"
+	// pkt-line followed by a flush, then the actual ref advertisement.
+	svcLine, err := readPktLine(refsBuf)
+	if err != nil {
+		sendError(conn, "backend error reading refs")
+		return
+	}
+	if svcLine == nil || !bytes.HasPrefix(svcLine, []byte("# service=")) {
+		sendError(conn, "unexpected backend response")
+		return
+	}
+	flushLine, err := readPktLine(refsBuf)
+	if err != nil {
+		sendError(conn, "backend error reading refs")
+		return
+	}
+	if flushLine != nil {
+		sendError(conn, "expected flush after service header")
+		return
+	}
+
+	// Forward ref advertisement to client, stripping multi-round
+	// negotiation capabilities from the first ref line so the client
+	// uses simple (single-round) ack mode. This lets us bridge to
+	// stateless HTTP on the backend.
+	//
+	// Also build a SHA→ref map so we can log which refs the client wants.
+	shaToRef := make(map[string]string) // SHA prefix → ref name
+	firstRef := true
+	for {
+		refLine, err := readPktLine(refsBuf)
+		if err != nil {
+			p.logf("gitproxy: reading backend ref: %v", err)
+			return
+		}
+		if refLine == nil {
+			if err := writeFlush(conn); err != nil {
+				return
+			}
+			break
+		}
+		if firstRef {
+			firstRef = false
+			refLine = stripMultiRoundCaps(refLine)
+		}
+		// Ref lines are "SHA refname\n" (first line has caps after NUL).
+		if s := string(refLine); len(s) >= 41 && s[40] == ' ' {
+			sha := s[:40]
+			refName, _, _ := strings.Cut(s[41:], "\x00")
+			refName = strings.TrimRight(refName, "\n")
+			shaToRef[sha] = refName
+		}
+		if err := writePktLine(conn, refLine); err != nil {
+			return
+		}
+	}
+
+	// Read client wants until flush. Buffer for HTTP POST.
+	// EOF here is normal for ls-remote which disconnects after refs.
+	var postBody bytes.Buffer
+	var wantRefs []string
+	seenWant := make(map[string]bool)
+	hasDeepen := false
+	for {
+		line, err := readPktLine(br)
+		if err != nil {
+			// ls-remote: client disconnects after reading refs.
+			p.logf("gitproxy: ls-remote %s by %s", repoPath, whoStr)
+			return
+		}
+		if line == nil {
+			postBody.WriteString("0000")
+			break
+		}
+		if bytes.HasPrefix(line, []byte("want ")) && len(line) >= 45 {
+			sha := string(line[5:45])
+			ref := sha[:12]
+			if r, ok := shaToRef[sha]; ok {
+				ref = r
+			}
+			if !seenWant[ref] {
+				seenWant[ref] = true
+				wantRefs = append(wantRefs, ref)
+			}
+		}
+		if bytes.HasPrefix(line, []byte("deepen")) ||
+			bytes.HasPrefix(line, []byte("deepen-since")) ||
+			bytes.HasPrefix(line, []byte("deepen-not")) {
+			hasDeepen = true
+		}
+		postBody.Write(encodePktLine(line))
+	}
+
+	var wantStr string
+	switch {
+	case len(wantRefs) <= 3:
+		wantStr = strings.Join(wantRefs, ", ")
+	default:
+		wantStr = fmt.Sprintf("%s, ... (%d refs)", strings.Join(wantRefs[:3], ", "), len(wantRefs))
+	}
+
+	backendRepo := backendBase + repoPath
+	if hasDeepen {
+		p.logf("gitproxy: shallow clone %s [%s] by %s", repoPath, wantStr, whoStr)
+		p.handleHTTPSShallow(ctx, conn, br, &postBody, backendRepo)
+	} else {
+		p.handleHTTPSRegular(ctx, conn, br, &postBody, backendRepo, repoPath, wantStr, whoStr)
+	}
+}
+
+// handleHTTPSRegular handles the standard (non-shallow) fetch path over HTTPS.
+//
+// The git:// interactive protocol and the HTTP stateless protocol have
+// different negotiation models. In git://, the client sends haves in
+// batches separated by flushes and reads ACK/NAK after each (except
+// the first batch, which it pipelines). In HTTP, everything goes in
+// one POST. We bridge this by:
+//  1. Collecting all haves from the client, sending NAK for each flush
+//  2. POSTing wants+haves+done to the backend
+//  3. Consuming the backend's NAK/ACK from the response
+//  4. Sending a final NAK/ACK to the client (for the response it
+//     expects after "done")
+//  5. Streaming the pack data
+func (p *GitProxy) handleHTTPSRegular(ctx context.Context, conn net.Conn, br *bufio.Reader, postBody *bytes.Buffer, backendRepo, repoPath, wantStr, whoStr string) {
+	var numHaves int
+	for {
+		line, err := readPktLine(br)
+		if err != nil {
+			if wantStr == "" {
+				p.logf("gitproxy: ls-remote %s by %s", repoPath, whoStr)
+			}
+			return // EOF is normal for ls-remote or up-to-date fetch
+		}
+		if line == nil {
+			if err := writePktLine(conn, []byte("NAK\n")); err != nil {
+				return
+			}
+			continue
+		}
+		if bytes.HasPrefix(line, []byte("have ")) {
+			numHaves++
+		}
+		postBody.Write(encodePktLine(line))
+		if bytes.HasPrefix(line, []byte("done")) {
+			break
+		}
+	}
+
+	if numHaves == 0 {
+		p.logf("gitproxy: clone %s [%s] by %s", repoPath, wantStr, whoStr)
+	} else {
+		p.logf("gitproxy: fetch %s [%s] (%d haves) by %s", repoPath, wantStr, numHaves, whoStr)
+	}
+
+	uploadURL := backendRepo + "/git-upload-pack"
+	postResp, err := p.httpPost(ctx, uploadURL, "application/x-git-upload-pack-request", postBody)
+	if err != nil {
+		p.logf("gitproxy: backend POST: %v", err)
+		return
+	}
+	defer postResp.Body.Close()
+	if postResp.StatusCode != 200 {
+		sendError(conn, fmt.Sprintf("backend upload-pack error (HTTP %d)", postResp.StatusCode))
+		return
+	}
+
+	// The backend response may start with NAK/ACK pkt-line(s)
+	// (possibly multiple in multi_ack format) followed by pack data,
+	// or it may start with pack data directly (side-band encoded).
+	//
+	// The client is in simple ack mode and expects one final NAK
+	// after "done", then pack data. We consume any backend ACK/NAK
+	// lines, send a single NAK to the client, then stream the pack.
+	respBuf := bufio.NewReader(postResp.Body)
+
+	for {
+		peek, err := respBuf.Peek(5)
+		if err != nil || len(peek) < 5 {
+			break
+		}
+		// After the 4-byte pkt-line header, the payload byte tells
+		// us the type. ACK starts with 'A' (0x41), NAK with 'N'
+		// (0x4E). Side-band pack data starts with \x01, \x02, or \x03.
+		payloadByte := peek[4]
+		if payloadByte != 'A' && payloadByte != 'N' {
+			break // Not ACK/NAK; this is pack data.
+		}
+		line, err := readPktLine(respBuf)
+		if err != nil {
+			p.logf("gitproxy: reading backend ack: %v", err)
+			return
+		}
+		if line == nil {
+			break
+		}
+	}
+
+	// Send a single NAK to the client.
+	if err := writePktLine(conn, []byte("NAK\n")); err != nil {
+		return
+	}
+
+	// Stream the pack data (side-band encoded if negotiated).
+	if _, err := io.Copy(conn, respBuf); err != nil {
+		p.logf("gitproxy: streaming pack: %v", err)
+	}
+}
+
+// handleHTTPSShallow handles shallow clone/fetch (deepen was requested) over HTTPS.
+//
+// In git:// protocol, after the client sends wants+deepen+flush, the server
+// responds with shallow/unshallow lines + flush BEFORE the client sends
+// haves/done. In HTTP smart protocol, it's all one round-trip.
+//
+// We bridge this by POSTing wants+deepen+done (without haves) to the backend,
+// forwarding the shallow lines to the client, then reading and discarding
+// the client's done, and finally streaming the packfile.
+func (p *GitProxy) handleHTTPSShallow(ctx context.Context, conn net.Conn, br *bufio.Reader, postBody *bytes.Buffer, backendRepo string) {
+	// Complete the POST body with "done" since in HTTP stateless mode
+	// everything goes in one request.
+	postBody.Write(encodePktLine([]byte("done\n")))
+
+	uploadURL := backendRepo + "/git-upload-pack"
+	postResp, err := p.httpPost(ctx, uploadURL, "application/x-git-upload-pack-request", postBody)
+	if err != nil {
+		p.logf("gitproxy: backend POST: %v", err)
+		return
+	}
+	defer postResp.Body.Close()
+	if postResp.StatusCode != 200 {
+		sendError(conn, fmt.Sprintf("backend upload-pack error (HTTP %d)", postResp.StatusCode))
+		return
+	}
+
+	respBuf := bufio.NewReader(postResp.Body)
+
+	// Read shallow/unshallow lines from the response and forward to the client.
+	// These are pkt-lines terminated by a flush packet.
+	for {
+		line, err := readPktLine(respBuf)
+		if err != nil {
+			p.logf("gitproxy: reading shallow response: %v", err)
+			return
+		}
+		if line == nil {
+			if err := writeFlush(conn); err != nil {
+				return
+			}
+			break
+		}
+		if err := writePktLine(conn, line); err != nil {
+			return
+		}
+	}
+
+	// The client now sends haves (if any) and "done". We discard them
+	// since we already included "done" in our POST.
+	for {
+		line, err := readPktLine(br)
+		if err != nil {
+			return
+		}
+		if line == nil {
+			continue // flush between batches
+		}
+		if bytes.HasPrefix(line, []byte("done")) {
+			break
+		}
+	}
+
+	// Stream the remaining response (NAK/ACK + packfile) to the client.
+	if _, err := io.Copy(conn, respBuf); err != nil {
+		p.logf("gitproxy: streaming pack: %v", err)
+	}
+}
+
+// stripMultiRoundCaps removes negotiation capabilities that require
+// multi-round exchange from the first ref line's capability list.
+// The first ref line format is: "<sha> <refname>\0<cap1> <cap2> ...\n"
+func stripMultiRoundCaps(line []byte) []byte {
+	nulIdx := bytes.IndexByte(line, 0)
+	if nulIdx < 0 {
+		return line
+	}
+	refPart := line[:nulIdx]
+	capsStr := strings.TrimRight(string(line[nulIdx+1:]), "\n")
+	caps := strings.Fields(capsStr)
+
+	filtered := caps[:0:0]
+	for _, c := range caps {
+		switch c {
+		case "multi_ack", "multi_ack_detailed", "no-done":
+			// Drop: these require stateful multi-round negotiation
+			// which can't be bridged to stateless HTTP.
+		default:
+			filtered = append(filtered, c)
+		}
+	}
+
+	var buf []byte
+	buf = append(buf, refPart...)
+	buf = append(buf, 0)
+	buf = append(buf, strings.Join(filtered, " ")...)
+	buf = append(buf, '\n')
+	return buf
+}
+
+func sendError(w io.Writer, msg string) {
+	writePktLine(w, []byte("ERR "+msg+"\n"))
+}
+
+// serveIndex serves the HTTP index page showing what rogitproxy is,
+// the caller's granted repos, and git remote add examples.
+func (p *GitProxy) serveIndex(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path != "/" {
+		http.NotFound(w, r)
+		return
+	}
+
+	// Determine our own hostname for the git remote examples.
+	nodeName := "rogitproxy"
+	if p.LocalClient != nil {
+		if st, err := p.LocalClient.StatusWithoutPeers(r.Context()); err == nil && st.Self != nil {
+			nodeName = strings.TrimSuffix(st.Self.DNSName, ".")
+		}
+	}
+
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	fmt.Fprintf(w, "rogitproxy — read-only git proxy\n")
+	fmt.Fprintf(w, "=================================\n\n")
+	fmt.Fprintf(w, "This is a read-only git protocol proxy. It allows cloning and fetching\n")
+	fmt.Fprintf(w, "repositories over the git:// protocol on your tailnet.\n\n")
+
+	if p.LocalClient == nil {
+		fmt.Fprintf(w, "Running in dev mode (no tailnet identity available).\n")
+		return
+	}
+
+	who, err := p.LocalClient.WhoIs(r.Context(), r.RemoteAddr)
+	if err != nil {
+		fmt.Fprintf(w, "Could not identify you: %v\n", err)
+		return
+	}
+
+	fmt.Fprintf(w, "Hello, %s\n\n", who.UserProfile.LoginName)
+
+	// Collect all repos the user has pull access to.
+	var repos []string
+	for _, raw := range who.CapMap[grantCap] {
+		var g grantValue
+		if err := json.Unmarshal([]byte(raw), &g); err != nil {
+			continue
+		}
+		if g.Access != AccessPull {
+			continue
+		}
+		repos = append(repos, g.Repos...)
+	}
+
+	if len(repos) == 0 {
+		fmt.Fprintf(w, "You do not currently have access to any repositories through this proxy.\n")
+		fmt.Fprintf(w, "Ask your tailnet admin to grant you the %s capability.\n", grantCap)
+		return
+	}
+
+	fmt.Fprintf(w, "You have read-only access to the following repositories:\n\n")
+	for _, repo := range repos {
+		fmt.Fprintf(w, "  %s\n", repo)
+	}
+	fmt.Fprintf(w, "\nTo add a read-only remote, run:\n\n")
+	for _, repo := range repos {
+		fmt.Fprintf(w, "  git remote add ro git://%s/%s.git\n", nodeName, repo)
+	}
+	fmt.Fprintf(w, "\nThen clone or fetch:\n\n")
+	if len(repos) > 0 {
+		fmt.Fprintf(w, "  git clone git://%s/%s.git\n", nodeName, repos[0])
+	}
+}
+
+// --- pkt-line encoding/decoding ---
+
+// readPktLine reads a single git pkt-line from r.
+// Returns nil for a flush packet (0000).
+func readPktLine(r io.Reader) ([]byte, error) {
+	var hdr [4]byte
+	if _, err := io.ReadFull(r, hdr[:]); err != nil {
+		return nil, err
+	}
+	var lenBytes [2]byte
+	if _, err := hex.Decode(lenBytes[:], hdr[:]); err != nil {
+		return nil, fmt.Errorf("invalid pkt-line header %q: %w", hdr, err)
+	}
+	length := int(lenBytes[0])<<8 | int(lenBytes[1])
+	if length == 0 {
+		return nil, nil // flush
+	}
+	if length < 4 {
+		return nil, fmt.Errorf("invalid pkt-line length: %d", length)
+	}
+	data := make([]byte, length-4)
+	if _, err := io.ReadFull(r, data); err != nil {
+		return nil, err
+	}
+	return data, nil
+}
+
+func writePktLine(w io.Writer, data []byte) error {
+	_, err := fmt.Fprintf(w, "%04x%s", len(data)+4, data)
+	return err
+}
+
+func writeFlush(w io.Writer) error {
+	_, err := io.WriteString(w, "0000")
+	return err
+}
+
+func encodePktLine(data []byte) []byte {
+	return fmt.Appendf(nil, "%04x%s", len(data)+4, data)
+}
