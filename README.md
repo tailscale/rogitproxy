@@ -9,11 +9,11 @@ without exposing HTTPS credentials or SSH keys in the sandbox environment.
 
 ## Usage
 
-    rogitproxy --backend https://github.com
+    $ rogitproxy
 
 In dev mode (no tsnet, listens on localhost):
 
-    rogitproxy --dev --backend https://github.com
+    $ rogitproxy --dev
 
 Then:
 
@@ -22,15 +22,16 @@ Then:
 
 ## GitHub App authentication
 
-When the backend is `https://github.com` and a GitHub App private key is
-available (at `~/keys/rogitproxy.pem` or via setec), rogitproxy authenticates
-to GitHub using a GitHub App installation token.
+When the backend is `https://github.com` (the default) and either a
+GitHub App private key is available (at `~/keys/rogitproxy.pem`) or in
+[setec](https://github.com/tailscale/setec/)), rogitproxy
+authenticates to GitHub using a GitHub App installation token.
 
 Flags:
 
-    --github-app-id          GitHub App ID (default 3091475)
-    --github-app-install-id  GitHub App installation ID (default 116358802)
-    --setec-url              setec server URL, for fetching the private key
+    --github-app-id=N          GitHub App ID
+    --github-app-install-id=N  GitHub App installation ID
+    --setec-url                setec server URL, for fetching the private key
 
 ## Access control
 
