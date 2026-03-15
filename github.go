@@ -19,6 +19,7 @@ import (
 var (
 	gitHubAppID          = flag.Int64("github-app-id", 3091475, "GitHub App ID")
 	gitHubInstallationID = flag.Int64("github-app-install-id", 116358802, "GitHub App installation ID")
+	setecSecret          = flag.String("setec-secret", "prod/rogitproxy/github-app-key-pem", "setec secret name for the GitHub App private key")
 )
 
 // GitHubAppTransport returns an http.RoundTripper that authenticates
@@ -89,7 +90,7 @@ func getGitHubAppPrivateKey(ctx context.Context, setecURL string, setecDo func(*
 		}
 		ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 		defer cancel()
-		v, err := sc.Get(ctx, "prod/rogitproxy/github-app-key-pem")
+		v, err := sc.Get(ctx, *setecSecret)
 		if err != nil {
 			return nil, fmt.Errorf("setec: %w", err)
 		}
