@@ -1,4 +1,4 @@
-module rogitproxy
+module github.com/tailscale/rogitproxy
 
 go 1.26.1
 
