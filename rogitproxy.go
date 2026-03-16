@@ -29,6 +29,7 @@ import (
 
 	"tailscale.com/client/local"
 	"tailscale.com/client/tailscale/apitype"
+	"tailscale.com/ipn"
 	"tailscale.com/tailcfg"
 	"tailscale.com/tsnet"
 	"tailscale.com/tsweb"
@@ -62,19 +63,22 @@ func main() {
 			Hostname: *hostname,
 		}
 		defer srv.Close()
-		ln, err = srv.Listen("tcp", ":9418")
-		if err != nil {
-			log.Fatal(err)
+		if err := srv.Start(); err != nil {
+			log.Fatalf("tsnet.Start: %v", err)
 		}
-		log.Printf("tsnet: listening as %s:9418", *hostname)
-	}
-
-	if srv != nil {
 		lc, err := srv.LocalClient()
 		if err != nil {
 			log.Fatalf("LocalClient: %v", err)
 		}
 		proxy.LocalClient = lc
+		if err := awaitRunning(lc); err != nil {
+			log.Fatalf("awaitRunning: %v", err)
+		}
+		ln, err = srv.Listen("tcp", ":9418")
+		if err != nil {
+			log.Fatal(err)
+		}
+		log.Printf("tsnet: listening as %s:9418", *hostname)
 	}
 
 	_, keyOnDisk := getGitHubAppPrivateKeyFromDisk()
@@ -117,6 +121,26 @@ func main() {
 	}
 
 	log.Fatal(proxy.Serve(ln))
+}
+
+func awaitRunning(lc *local.Client) error {
+	w, err := lc.WatchIPNBus(context.Background(), 0)
+	if err != nil {
+		return fmt.Errorf("WatchIPNBus: %w", err)
+	}
+	defer w.Close()
+	for {
+		n, err := w.Next()
+		if err != nil {
+			return fmt.Errorf("IPNBus.Next: %w", err)
+		}
+		if n.State != nil {
+			log.Printf("state: %v", *n.State)
+			if *n.State == ipn.Running {
+				return nil
+			}
+		}
+	}
 }
 
 const grantCap tailcfg.PeerCapability = "github.com/tailscale/rogitproxy"
