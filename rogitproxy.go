@@ -496,9 +496,9 @@ func (p *GitProxy) handleHTTPSv2(ctx context.Context, conn net.Conn, br *bufio.R
 			return
 		}
 
-		// Log want/have counts for fetch commands.
+		// Count wants/haves for fetch commands.
+		var numWants, numHaves int
 		if cmdName == "fetch" {
-			var numWants, numHaves int
 			for _, line := range bytes.Split(rawBody.Bytes(), []byte("\n")) {
 				s := string(line)
 				if strings.HasPrefix(s, "want ") || strings.Contains(s, "want ") {
@@ -507,11 +507,6 @@ func (p *GitProxy) handleHTTPSv2(ctx context.Context, conn net.Conn, br *bufio.R
 				if strings.HasPrefix(s, "have ") || strings.Contains(s, "have ") {
 					numHaves++
 				}
-			}
-			if numHaves == 0 {
-				p.logf("gitproxy: clone %s (%d wants) by %s", repoPath, numWants, whoStr)
-			} else {
-				p.logf("gitproxy: fetch %s (%d wants, %d haves) by %s", repoPath, numWants, numHaves, whoStr)
 			}
 		}
 
@@ -530,12 +525,27 @@ func (p *GitProxy) handleHTTPSv2(ctx context.Context, conn net.Conn, br *bufio.R
 		}
 
 		respBuf := bufio.NewReader(postResp.Body)
-		if err := forwardV2Response(conn, respBuf); err != nil {
+		info, err := forwardV2Response(conn, respBuf)
+		if err != nil {
 			p.logf("gitproxy: forwarding v2 response: %v", err)
 			postResp.Body.Close()
 			return
 		}
 		postResp.Body.Close()
+
+		// Log fetch results after we know whether it was a negotiation
+		// round (NAK, no packfile) or the final round (with packfile).
+		if cmdName == "fetch" {
+			if info.hadPackfile {
+				if numHaves == 0 {
+					p.logf("gitproxy: clone %s (%d wants, %s) by %s", repoPath, numWants, formatBytes(info.bytes), whoStr)
+				} else {
+					p.logf("gitproxy: fetch %s (%d wants, %d haves, %s) by %s", repoPath, numWants, numHaves, formatBytes(info.bytes), whoStr)
+				}
+			} else {
+				p.logf("gitproxy: fetch %s negotiating (%d haves) by %s", repoPath, numHaves, whoStr)
+			}
+		}
 	}
 }
 
@@ -581,48 +591,80 @@ func readV2Command(br *bufio.Reader) (cmdName string, rawBody bytes.Buffer, err 
 	}
 }
 
+// v2ResponseInfo contains information about a forwarded v2 response,
+// populated by forwardV2Response.
+type v2ResponseInfo struct {
+	hadPackfile bool  // whether a "packfile" section was seen
+	bytes       int64 // total bytes forwarded (headers + payloads)
+}
+
 // forwardV2Response streams a git protocol v2 response from the HTTP backend
 // to the git:// client. It reads pkt-line headers, forwards data and special
 // packets, and stops at response-end (0002) which is HTTP-only.
-func forwardV2Response(dst io.Writer, src *bufio.Reader) error {
+func forwardV2Response(dst io.Writer, src *bufio.Reader) (v2ResponseInfo, error) {
+	var info v2ResponseInfo
 	for {
 		var hdr [4]byte
 		if _, err := io.ReadFull(src, hdr[:]); err != nil {
 			if err == io.EOF || err == io.ErrUnexpectedEOF {
-				return nil // clean end of response
+				return info, nil // clean end of response
 			}
-			return err
+			return info, err
 		}
+		info.bytes += 4
 
 		switch string(hdr[:]) {
 		case "0000": // flush
 			if _, err := dst.Write(hdr[:]); err != nil {
-				return err
+				return info, err
 			}
 		case "0001": // delimiter
 			if _, err := dst.Write(hdr[:]); err != nil {
-				return err
+				return info, err
 			}
 		case "0002": // response-end — don't forward, stop
-			return nil
+			return info, nil
 		default:
 			// Data packet: forward header + payload.
 			if _, err := dst.Write(hdr[:]); err != nil {
-				return err
+				return info, err
 			}
 			var lenBytes [2]byte
 			if _, err := hex.Decode(lenBytes[:], hdr[:]); err != nil {
-				return fmt.Errorf("invalid pkt-line header %q: %w", hdr, err)
+				return info, fmt.Errorf("invalid pkt-line header %q: %w", hdr, err)
 			}
 			length := int(lenBytes[0])<<8 | int(lenBytes[1])
 			if length < 4 {
-				return fmt.Errorf("invalid pkt-line length: %d", length)
+				return info, fmt.Errorf("invalid pkt-line length: %d", length)
 			}
-			payloadLen := length - 4
-			if _, err := io.CopyN(dst, src, int64(payloadLen)); err != nil {
-				return err
+			payloadLen := int64(length - 4)
+
+			// Peek at first byte to detect "packfile" section marker.
+			if !info.hadPackfile && payloadLen >= 8 {
+				if peek, err := src.Peek(8); err == nil && string(peek) == "packfile" {
+					info.hadPackfile = true
+				}
+			}
+
+			info.bytes += payloadLen
+			if _, err := io.CopyN(dst, src, payloadLen); err != nil {
+				return info, err
 			}
 		}
+	}
+}
+
+// formatBytes returns a human-readable byte count (e.g. "1.2 MiB").
+func formatBytes(b int64) string {
+	switch {
+	case b >= 1<<30:
+		return fmt.Sprintf("%.1f GiB", float64(b)/(1<<30))
+	case b >= 1<<20:
+		return fmt.Sprintf("%.1f MiB", float64(b)/(1<<20))
+	case b >= 1<<10:
+		return fmt.Sprintf("%.1f KiB", float64(b)/(1<<10))
+	default:
+		return fmt.Sprintf("%d B", b)
 	}
 }
 
