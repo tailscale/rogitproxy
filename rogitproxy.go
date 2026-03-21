@@ -198,6 +198,7 @@ func (p *GitProxy) httpGet(ctx context.Context, url string) (*http.Response, err
 		return nil, err
 	}
 	req.Header.Set("Accept", "*/*")
+	req.Header.Set("Git-Protocol", "version=2")
 	return p.httpClient().Do(req)
 }
 
@@ -210,6 +211,7 @@ func (p *GitProxy) httpPost(ctx context.Context, url, contentType string, body i
 	}
 	req.Header.Set("Content-Type", contentType)
 	req.Header.Set("Accept", "application/x-git-upload-pack-result")
+	req.Header.Set("Git-Protocol", "version=2")
 	return p.httpClient().Do(req)
 }
 
@@ -235,12 +237,12 @@ func (p *GitProxy) handleConn(conn net.Conn) {
 
 	// Read the initial request pkt-line.
 	// Format: "git-upload-pack /repo\0host=hostname\0"
-	line, err := readPktLine(br)
+	line, pktType, err := readPktLine(br)
 	if err != nil {
 		p.logf("gitproxy: reading request: %v", err)
 		return
 	}
-	if line == nil {
+	if pktType != pktData || line == nil {
 		return
 	}
 
@@ -287,10 +289,19 @@ func (p *GitProxy) handleConn(conn net.Conn) {
 	if p.isSSH() {
 		p.logf("gitproxy: connect %s by %s", repoPath, whoStr)
 		p.handleSSH(ctx, conn, br, repoPath)
-	} else {
-		p.logf("gitproxy: request %s by %s", repoPath, whoStr)
-		p.handleHTTPS(ctx, conn, br, repoPath, whoStr)
+		return
 	}
+
+	// Check for git protocol v2. The git:// v2 initial request has extra
+	// params after the second NUL: "git-upload-pack /repo\0host=X\0\0version=2\0"
+	isV2 := len(parts) >= 3 && strings.Contains(string(parts[2]), "version=2")
+	if !isV2 {
+		sendError(conn, "this proxy requires git protocol v2; upgrade to git 2.26+")
+		return
+	}
+
+	p.logf("gitproxy: request %s by %s (v2)", repoPath, whoStr)
+	p.handleHTTPSv2(ctx, conn, br, repoPath, whoStr)
 }
 
 // whoIs returns the WhoIs response for the remote peer, or nil if
@@ -392,14 +403,12 @@ func (p *GitProxy) handleSSH(ctx context.Context, conn net.Conn, br *bufio.Reade
 	}
 }
 
-// handleHTTPS proxies via the git smart HTTP protocol. This requires
-// bridging the interactive git:// protocol to HTTP's request/response
-// model: we strip multi-round negotiation capabilities and handle
-// the shallow protocol specially.
-func (p *GitProxy) handleHTTPS(ctx context.Context, conn net.Conn, br *bufio.Reader, repoPath, whoStr string) {
+// handleHTTPSv2 proxies git protocol v2 over HTTPS. Each client command
+// maps 1:1 to one backend HTTP request, making the proxy a transparent pipe.
+func (p *GitProxy) handleHTTPSv2(ctx context.Context, conn net.Conn, br *bufio.Reader, repoPath, whoStr string) {
 	backendBase := strings.TrimRight(p.Backend, "/")
 
-	// Fetch ref advertisement from HTTPS backend.
+	// Phase A: Capability advertisement.
 	refsURL := backendBase + repoPath + "/info/refs?service=git-upload-pack"
 	resp, err := p.httpGet(ctx, refsURL)
 	if err != nil {
@@ -416,311 +425,205 @@ func (p *GitProxy) handleHTTPS(ctx context.Context, conn net.Conn, br *bufio.Rea
 
 	refsBuf := bufio.NewReader(resp.Body)
 
-	// Smart HTTP ref response starts with "# service=git-upload-pack\n"
-	// pkt-line followed by a flush, then the actual ref advertisement.
-	svcLine, err := readPktLine(refsBuf)
-	if err != nil {
+	// The v2 info/refs response may or may not start with
+	// "# service=git-upload-pack\n" + flush (GitHub includes it,
+	// git-http-backend does not). Read the first pkt-line and check.
+	firstLine, pt, err := readPktLine(refsBuf)
+	if err != nil || pt != pktData {
 		sendError(conn, "backend error reading refs")
 		return
 	}
-	if svcLine == nil || !bytes.HasPrefix(svcLine, []byte("# service=")) {
-		sendError(conn, "unexpected backend response")
+	if bytes.HasPrefix(firstLine, []byte("# service=")) {
+		// Skip the flush after the service header.
+		if _, pt, err := readPktLine(refsBuf); err != nil || pt != pktFlush {
+			sendError(conn, "expected flush after service header")
+			return
+		}
+		// Read the actual version line.
+		firstLine, pt, err = readPktLine(refsBuf)
+		if err != nil || pt != pktData {
+			sendError(conn, "backend did not return protocol v2")
+			return
+		}
+	}
+
+	// firstLine should now be "version 2\n".
+	if !bytes.HasPrefix(firstLine, []byte("version 2")) {
+		sendError(conn, fmt.Sprintf("backend returned unexpected version: %s", firstLine))
 		return
 	}
-	flushLine, err := readPktLine(refsBuf)
-	if err != nil {
-		sendError(conn, "backend error reading refs")
-		return
-	}
-	if flushLine != nil {
-		sendError(conn, "expected flush after service header")
+	versionLine := firstLine
+
+	// Send version line to client.
+	if err := writePktLine(conn, versionLine); err != nil {
 		return
 	}
 
-	// Forward ref advertisement to client, stripping multi-round
-	// negotiation capabilities from the first ref line so the client
-	// uses simple (single-round) ack mode. This lets us bridge to
-	// stateless HTTP on the backend.
-	//
-	// Also build a SHA→ref map so we can log which refs the client wants.
-	shaToRef := make(map[string]string) // SHA prefix → ref name
-	firstRef := true
+	// Read and forward capability lines, filtering out wait-for-done.
 	for {
-		refLine, err := readPktLine(refsBuf)
+		capLine, pt, err := readPktLine(refsBuf)
 		if err != nil {
-			p.logf("gitproxy: reading backend ref: %v", err)
+			p.logf("gitproxy: reading backend caps: %v", err)
 			return
 		}
-		if refLine == nil {
+		if pt == pktFlush {
 			if err := writeFlush(conn); err != nil {
 				return
 			}
 			break
 		}
-		if firstRef {
-			firstRef = false
-			refLine = stripMultiRoundCaps(refLine)
-		}
-		// Ref lines are "SHA refname\n" (first line has caps after NUL).
-		if s := string(refLine); len(s) >= 41 && s[40] == ' ' {
-			sha := s[:40]
-			refName, _, _ := strings.Cut(s[41:], "\x00")
-			refName = strings.TrimRight(refName, "\n")
-			shaToRef[sha] = refName
-		}
-		if err := writePktLine(conn, refLine); err != nil {
-			return
-		}
-	}
-
-	// Read client wants until flush. Buffer for HTTP POST.
-	// EOF here is normal for ls-remote which disconnects after refs.
-	var postBody bytes.Buffer
-	var wantRefs []string
-	seenWant := make(map[string]bool)
-	hasDeepen := false
-	for {
-		line, err := readPktLine(br)
-		if err != nil {
-			// ls-remote: client disconnects after reading refs.
-			p.logf("gitproxy: ls-remote %s by %s", repoPath, whoStr)
-			return
-		}
-		if line == nil {
-			postBody.WriteString("0000")
-			break
-		}
-		if bytes.HasPrefix(line, []byte("want ")) && len(line) >= 45 {
-			sha := string(line[5:45])
-			ref := sha[:12]
-			if r, ok := shaToRef[sha]; ok {
-				ref = r
-			}
-			if !seenWant[ref] {
-				seenWant[ref] = true
-				wantRefs = append(wantRefs, ref)
-			}
-		}
-		if bytes.HasPrefix(line, []byte("deepen")) ||
-			bytes.HasPrefix(line, []byte("deepen-since")) ||
-			bytes.HasPrefix(line, []byte("deepen-not")) {
-			hasDeepen = true
-		}
-		postBody.Write(encodePktLine(line))
-	}
-
-	var wantStr string
-	switch {
-	case len(wantRefs) <= 3:
-		wantStr = strings.Join(wantRefs, ", ")
-	default:
-		wantStr = fmt.Sprintf("%s, ... (%d refs)", strings.Join(wantRefs[:3], ", "), len(wantRefs))
-	}
-
-	backendRepo := backendBase + repoPath
-	if hasDeepen {
-		p.logf("gitproxy: shallow clone %s [%s] by %s", repoPath, wantStr, whoStr)
-		p.handleHTTPSShallow(ctx, conn, br, &postBody, backendRepo)
-	} else {
-		p.handleHTTPSRegular(ctx, conn, br, &postBody, backendRepo, repoPath, wantStr, whoStr)
-	}
-}
-
-// handleHTTPSRegular handles the standard (non-shallow) fetch path over HTTPS.
-//
-// The git:// interactive protocol and the HTTP stateless protocol have
-// different negotiation models. In git://, the client sends haves in
-// batches separated by flushes and reads ACK/NAK after each (except
-// the first batch, which it pipelines). In HTTP, everything goes in
-// one POST. We bridge this by:
-//  1. Collecting all haves from the client, sending NAK for each flush
-//  2. POSTing wants+haves+done to the backend
-//  3. Consuming the backend's NAK/ACK from the response
-//  4. Sending a final NAK/ACK to the client (for the response it
-//     expects after "done")
-//  5. Streaming the pack data
-func (p *GitProxy) handleHTTPSRegular(ctx context.Context, conn net.Conn, br *bufio.Reader, postBody *bytes.Buffer, backendRepo, repoPath, wantStr, whoStr string) {
-	var numHaves int
-	for {
-		line, err := readPktLine(br)
-		if err != nil {
-			if wantStr == "" {
-				p.logf("gitproxy: ls-remote %s by %s", repoPath, whoStr)
-			}
-			return // EOF is normal for ls-remote or up-to-date fetch
-		}
-		if line == nil {
-			if err := writePktLine(conn, []byte("NAK\n")); err != nil {
-				return
-			}
+		if pt != pktData {
 			continue
 		}
-		if bytes.HasPrefix(line, []byte("have ")) {
-			numHaves++
+		// Strip wait-for-done capability — it forces single-round fetch
+		// which requires the server to wait, but we want the standard flow.
+		if bytes.HasPrefix(capLine, []byte("wait-for-done")) {
+			continue
 		}
-		postBody.Write(encodePktLine(line))
-		if bytes.HasPrefix(line, []byte("done")) {
-			break
-		}
-	}
-
-	if numHaves == 0 {
-		p.logf("gitproxy: clone %s [%s] by %s", repoPath, wantStr, whoStr)
-	} else {
-		p.logf("gitproxy: fetch %s [%s] (%d haves) by %s", repoPath, wantStr, numHaves, whoStr)
-	}
-
-	uploadURL := backendRepo + "/git-upload-pack"
-	postResp, err := p.httpPost(ctx, uploadURL, "application/x-git-upload-pack-request", postBody)
-	if err != nil {
-		p.logf("gitproxy: backend POST: %v", err)
-		return
-	}
-	defer postResp.Body.Close()
-	if postResp.StatusCode != 200 {
-		sendError(conn, fmt.Sprintf("backend upload-pack error (HTTP %d)", postResp.StatusCode))
-		return
-	}
-
-	// The backend response may start with NAK/ACK pkt-line(s)
-	// (possibly multiple in multi_ack format) followed by pack data,
-	// or it may start with pack data directly (side-band encoded).
-	//
-	// The client is in simple ack mode and expects one final NAK
-	// after "done", then pack data. We consume any backend ACK/NAK
-	// lines, send a single NAK to the client, then stream the pack.
-	respBuf := bufio.NewReader(postResp.Body)
-
-	for {
-		peek, err := respBuf.Peek(5)
-		if err != nil || len(peek) < 5 {
-			break
-		}
-		// After the 4-byte pkt-line header, the payload byte tells
-		// us the type. ACK starts with 'A' (0x41), NAK with 'N'
-		// (0x4E). Side-band pack data starts with \x01, \x02, or \x03.
-		payloadByte := peek[4]
-		if payloadByte != 'A' && payloadByte != 'N' {
-			break // Not ACK/NAK; this is pack data.
-		}
-		line, err := readPktLine(respBuf)
-		if err != nil {
-			p.logf("gitproxy: reading backend ack: %v", err)
+		if err := writePktLine(conn, capLine); err != nil {
 			return
 		}
-		if line == nil {
-			break
-		}
 	}
 
-	// Send a single NAK to the client.
-	if err := writePktLine(conn, []byte("NAK\n")); err != nil {
-		return
-	}
-
-	// Stream the pack data (side-band encoded if negotiated).
-	if _, err := io.Copy(conn, respBuf); err != nil {
-		p.logf("gitproxy: streaming pack: %v", err)
-	}
-}
-
-// handleHTTPSShallow handles shallow clone/fetch (deepen was requested) over HTTPS.
-//
-// In git:// protocol, after the client sends wants+deepen+flush, the server
-// responds with shallow/unshallow lines + flush BEFORE the client sends
-// haves/done. In HTTP smart protocol, it's all one round-trip.
-//
-// We bridge this by POSTing wants+deepen+done (without haves) to the backend,
-// forwarding the shallow lines to the client, then reading and discarding
-// the client's done, and finally streaming the packfile.
-func (p *GitProxy) handleHTTPSShallow(ctx context.Context, conn net.Conn, br *bufio.Reader, postBody *bytes.Buffer, backendRepo string) {
-	// Complete the POST body with "done" since in HTTP stateless mode
-	// everything goes in one request.
-	postBody.Write(encodePktLine([]byte("done\n")))
-
-	uploadURL := backendRepo + "/git-upload-pack"
-	postResp, err := p.httpPost(ctx, uploadURL, "application/x-git-upload-pack-request", postBody)
-	if err != nil {
-		p.logf("gitproxy: backend POST: %v", err)
-		return
-	}
-	defer postResp.Body.Close()
-	if postResp.StatusCode != 200 {
-		sendError(conn, fmt.Sprintf("backend upload-pack error (HTTP %d)", postResp.StatusCode))
-		return
-	}
-
-	respBuf := bufio.NewReader(postResp.Body)
-
-	// Read shallow/unshallow lines from the response and forward to the client.
-	// These are pkt-lines terminated by a flush packet.
+	// Phase B: Command loop.
 	for {
-		line, err := readPktLine(respBuf)
+		cmdName, rawBody, err := readV2Command(br)
 		if err != nil {
-			p.logf("gitproxy: reading shallow response: %v", err)
-			return
-		}
-		if line == nil {
-			if err := writeFlush(conn); err != nil {
-				return
+			// EOF is normal — client disconnected (e.g. after ls-remote).
+			if cmdName == "" {
+				p.logf("gitproxy: ls-remote %s by %s", repoPath, whoStr)
 			}
-			break
-		}
-		if err := writePktLine(conn, line); err != nil {
 			return
 		}
-	}
 
-	// The client now sends haves (if any) and "done". We discard them
-	// since we already included "done" in our POST.
-	for {
-		line, err := readPktLine(br)
+		// Log want/have counts for fetch commands.
+		if cmdName == "fetch" {
+			var numWants, numHaves int
+			for _, line := range bytes.Split(rawBody.Bytes(), []byte("\n")) {
+				s := string(line)
+				if strings.HasPrefix(s, "want ") || strings.Contains(s, "want ") {
+					numWants++
+				}
+				if strings.HasPrefix(s, "have ") || strings.Contains(s, "have ") {
+					numHaves++
+				}
+			}
+			if numHaves == 0 {
+				p.logf("gitproxy: clone %s (%d wants) by %s", repoPath, numWants, whoStr)
+			} else {
+				p.logf("gitproxy: fetch %s (%d wants, %d haves) by %s", repoPath, numWants, numHaves, whoStr)
+			}
+		}
+
+		uploadURL := backendBase + repoPath + "/git-upload-pack"
+		postResp, err := p.httpPost(ctx, uploadURL, "application/x-git-upload-pack-request", &rawBody)
 		if err != nil {
+			p.logf("gitproxy: backend POST: %v", err)
 			return
 		}
-		if line == nil {
-			continue // flush between batches
+		if postResp.StatusCode != 200 {
+			body, _ := io.ReadAll(io.LimitReader(postResp.Body, 512))
+			postResp.Body.Close()
+			p.logf("gitproxy: backend POST %s returned %d: %s", uploadURL, postResp.StatusCode, body)
+			sendError(conn, fmt.Sprintf("backend upload-pack error (HTTP %d)", postResp.StatusCode))
+			return
 		}
-		if bytes.HasPrefix(line, []byte("done")) {
-			break
-		}
-	}
 
-	// Stream the remaining response (NAK/ACK + packfile) to the client.
-	if _, err := io.Copy(conn, respBuf); err != nil {
-		p.logf("gitproxy: streaming pack: %v", err)
+		respBuf := bufio.NewReader(postResp.Body)
+		if err := forwardV2Response(conn, respBuf); err != nil {
+			p.logf("gitproxy: forwarding v2 response: %v", err)
+			postResp.Body.Close()
+			return
+		}
+		postResp.Body.Close()
 	}
 }
 
-// stripMultiRoundCaps removes negotiation capabilities that require
-// multi-round exchange from the first ref line's capability list.
-// The first ref line format is: "<sha> <refname>\0<cap1> <cap2> ...\n"
-func stripMultiRoundCaps(line []byte) []byte {
-	nulIdx := bytes.IndexByte(line, 0)
-	if nulIdx < 0 {
-		return line
+// readV2Command reads a complete git protocol v2 command from the client.
+// It returns the command name, the raw pkt-line encoded body (suitable for
+// POSTing to the backend), and any error. EOF means the client disconnected.
+func readV2Command(br *bufio.Reader) (cmdName string, rawBody bytes.Buffer, err error) {
+	// Read the first pkt-line — should be "command=<name>\n".
+	line, pt, err := readPktLine(br)
+	if err != nil {
+		return "", rawBody, err
 	}
-	refPart := line[:nulIdx]
-	capsStr := strings.TrimRight(string(line[nulIdx+1:]), "\n")
-	caps := strings.Fields(capsStr)
+	if pt != pktData {
+		return "", rawBody, fmt.Errorf("expected command pkt-line, got type %d", pt)
+	}
 
-	filtered := caps[:0:0]
-	for _, c := range caps {
-		switch c {
-		case "multi_ack", "multi_ack_detailed", "no-done":
-			// Drop: these require stateful multi-round negotiation
-			// which can't be bridged to stateless HTTP.
-		default:
-			filtered = append(filtered, c)
+	s := strings.TrimRight(string(line), "\n")
+	if !strings.HasPrefix(s, "command=") {
+		return "", rawBody, fmt.Errorf("expected command=, got %q", s)
+	}
+	cmdName = strings.TrimPrefix(s, "command=")
+
+	// Write the first line into the raw body.
+	rawBody.Write(encodePktLine(line))
+
+	// Accumulate remaining pkt-lines until flush.
+	for {
+		line, pt, err := readPktLine(br)
+		if err != nil {
+			return cmdName, rawBody, err
+		}
+		switch pt {
+		case pktFlush:
+			rawBody.WriteString("0000")
+			return cmdName, rawBody, nil
+		case pktDelimiter:
+			rawBody.WriteString("0001")
+		case pktResponseEnd:
+			rawBody.WriteString("0002")
+		case pktData:
+			rawBody.Write(encodePktLine(line))
 		}
 	}
+}
 
-	var buf []byte
-	buf = append(buf, refPart...)
-	buf = append(buf, 0)
-	buf = append(buf, strings.Join(filtered, " ")...)
-	buf = append(buf, '\n')
-	return buf
+// forwardV2Response streams a git protocol v2 response from the HTTP backend
+// to the git:// client. It reads pkt-line headers, forwards data and special
+// packets, and stops at response-end (0002) which is HTTP-only.
+func forwardV2Response(dst io.Writer, src *bufio.Reader) error {
+	for {
+		var hdr [4]byte
+		if _, err := io.ReadFull(src, hdr[:]); err != nil {
+			if err == io.EOF || err == io.ErrUnexpectedEOF {
+				return nil // clean end of response
+			}
+			return err
+		}
+
+		switch string(hdr[:]) {
+		case "0000": // flush
+			if _, err := dst.Write(hdr[:]); err != nil {
+				return err
+			}
+		case "0001": // delimiter
+			if _, err := dst.Write(hdr[:]); err != nil {
+				return err
+			}
+		case "0002": // response-end — don't forward, stop
+			return nil
+		default:
+			// Data packet: forward header + payload.
+			if _, err := dst.Write(hdr[:]); err != nil {
+				return err
+			}
+			var lenBytes [2]byte
+			if _, err := hex.Decode(lenBytes[:], hdr[:]); err != nil {
+				return fmt.Errorf("invalid pkt-line header %q: %w", hdr, err)
+			}
+			length := int(lenBytes[0])<<8 | int(lenBytes[1])
+			if length < 4 {
+				return fmt.Errorf("invalid pkt-line length: %d", length)
+			}
+			payloadLen := length - 4
+			if _, err := io.CopyN(dst, src, int64(payloadLen)); err != nil {
+				return err
+			}
+		}
+	}
 }
 
 func sendError(w io.Writer, msg string) {
@@ -797,29 +700,44 @@ func (p *GitProxy) serveIndex(w http.ResponseWriter, r *http.Request) {
 
 // --- pkt-line encoding/decoding ---
 
+// pktLineType represents the type of a pkt-line packet.
+type pktLineType int
+
+const (
+	pktData        pktLineType = iota // normal data packet
+	pktFlush                          // 0000 — flush packet
+	pktDelimiter                      // 0001 — delimiter packet (v2)
+	pktResponseEnd                    // 0002 — response-end packet (v2)
+)
+
 // readPktLine reads a single git pkt-line from r.
-// Returns nil for a flush packet (0000).
-func readPktLine(r io.Reader) ([]byte, error) {
+// Returns the payload (nil for special packets) and the packet type.
+func readPktLine(r io.Reader) ([]byte, pktLineType, error) {
 	var hdr [4]byte
 	if _, err := io.ReadFull(r, hdr[:]); err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 	var lenBytes [2]byte
 	if _, err := hex.Decode(lenBytes[:], hdr[:]); err != nil {
-		return nil, fmt.Errorf("invalid pkt-line header %q: %w", hdr, err)
+		return nil, 0, fmt.Errorf("invalid pkt-line header %q: %w", hdr, err)
 	}
 	length := int(lenBytes[0])<<8 | int(lenBytes[1])
-	if length == 0 {
-		return nil, nil // flush
+	switch length {
+	case 0:
+		return nil, pktFlush, nil
+	case 1:
+		return nil, pktDelimiter, nil
+	case 2:
+		return nil, pktResponseEnd, nil
 	}
 	if length < 4 {
-		return nil, fmt.Errorf("invalid pkt-line length: %d", length)
+		return nil, 0, fmt.Errorf("invalid pkt-line length: %d", length)
 	}
 	data := make([]byte, length-4)
 	if _, err := io.ReadFull(r, data); err != nil {
-		return nil, err
+		return nil, 0, err
 	}
-	return data, nil
+	return data, pktData, nil
 }
 
 func writePktLine(w io.Writer, data []byte) error {

@@ -5,6 +5,7 @@ package main
 
 import (
 	"encoding/json"
+	"flag"
 	"fmt"
 	"net"
 	"net/http"
@@ -59,13 +60,23 @@ func startGitHTTPBackend(t *testing.T) string {
 		t.Skipf("git-http-backend not found at %s", httpBackend)
 	}
 
-	handler := &cgi.Handler{
-		Path: httpBackend,
-		Env: []string{
-			"GIT_PROJECT_ROOT=" + repoRoot,
-			"GIT_HTTP_EXPORT_ALL=1",
-		},
-	}
+	// Wrap cgi.Handler so that the Git-Protocol HTTP header is passed
+	// through as GIT_PROTOCOL env var. Go's cgi package sets HTTP_GIT_PROTOCOL
+	// but git-http-backend reads GIT_PROTOCOL. We create a fresh handler per
+	// request to avoid shared-slice races on Env.
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		h := &cgi.Handler{
+			Path: httpBackend,
+			Env: []string{
+				"GIT_PROJECT_ROOT=" + repoRoot,
+				"GIT_HTTP_EXPORT_ALL=1",
+			},
+		}
+		if proto := r.Header.Get("Git-Protocol"); proto != "" {
+			h.Env = append(h.Env, "GIT_PROTOCOL="+proto)
+		}
+		h.ServeHTTP(w, r)
+	})
 
 	ln, err := net.Listen("tcp", "localhost:0")
 	if err != nil {
@@ -493,4 +504,113 @@ func TestCheckGrant(t *testing.T) {
 			}
 		})
 	}
+}
+
+var integration = flag.Bool("integration", false, "run integration tests against real GitHub")
+
+func TestIntegrationGitHub(t *testing.T) {
+	if !*integration {
+		t.Skip("skipping integration test; use -integration to enable")
+	}
+
+	// Start a local proxy backed by public GitHub (no auth needed).
+	ln, err := net.Listen("tcp", "localhost:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	proxy := &GitProxy{Backend: "https://github.com", Logf: t.Logf}
+	go proxy.Serve(ln)
+	t.Cleanup(func() { ln.Close() })
+	addr := ln.Addr().String()
+
+	t.Run("ls-remote", func(t *testing.T) {
+		cmd := exec.Command("git", "ls-remote", fmt.Sprintf("git://%s/tailscale/tailscale.git", addr))
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("git ls-remote failed: %v\n%s", err, out)
+		}
+		output := string(out)
+		if !strings.Contains(output, "HEAD") {
+			t.Errorf("expected HEAD in ls-remote output, got:\n%s", output[:min(len(output), 500)])
+		}
+		if !strings.Contains(output, "refs/heads/") {
+			t.Errorf("expected refs/heads/ in ls-remote output")
+		}
+		if !strings.Contains(output, "refs/tags/") {
+			t.Errorf("expected refs/tags/ in ls-remote output")
+		}
+		t.Logf("ls-remote returned %d bytes", len(out))
+	})
+
+	t.Run("clone", func(t *testing.T) {
+		dir := t.TempDir()
+		dest := filepath.Join(dir, "repo")
+
+		cmd := exec.Command("git", "clone", "--depth=1",
+			fmt.Sprintf("git://%s/tailscale/rogitproxy.git", addr), dest)
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("git clone failed: %v\n%s", err, out)
+		}
+
+		entries, err := os.ReadDir(dest)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(entries) == 0 {
+			t.Fatal("cloned repo is empty")
+		}
+
+		cmd = exec.Command("git", "-C", dest, "log", "--oneline")
+		out, err = cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("git log failed: %v\n%s", err, out)
+		}
+		t.Logf("clone log:\n%s", out)
+	})
+
+	t.Run("fetch-noop", func(t *testing.T) {
+		dir := t.TempDir()
+		dest := filepath.Join(dir, "repo")
+
+		// Clone first.
+		cmd := exec.Command("git", "clone", "--depth=1",
+			fmt.Sprintf("git://%s/tailscale/rogitproxy.git", addr), dest)
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("git clone failed: %v\n%s", err, out)
+		}
+
+		// Fetch from same repo — should be a no-op (already up to date).
+		cmd = exec.Command("git", "-C", dest, "fetch",
+			fmt.Sprintf("git://%s/tailscale/rogitproxy.git", addr), "HEAD")
+		out, err = cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("git fetch failed: %v\n%s", err, out)
+		}
+		t.Logf("fetch-noop output:\n%s", out)
+	})
+
+	t.Run("fetch-cross-repo", func(t *testing.T) {
+		dir := t.TempDir()
+		dest := filepath.Join(dir, "repo")
+
+		// Clone rogitproxy (small repo).
+		cmd := exec.Command("git", "clone", "--depth=1",
+			fmt.Sprintf("git://%s/tailscale/rogitproxy.git", addr), dest)
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("git clone failed: %v\n%s", err, out)
+		}
+
+		// Fetch from a different repo — exercises have/want negotiation
+		// with no common commits.
+		cmd = exec.Command("git", "-C", dest, "fetch",
+			fmt.Sprintf("git://%s/octocat/Hello-World.git", addr), "master")
+		out, err = cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("git fetch cross-repo failed: %v\n%s", err, out)
+		}
+		t.Logf("fetch-cross-repo output:\n%s", out)
+	})
 }
