@@ -26,6 +26,7 @@ import (
 	"net/url"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 
 	"tailscale.com/client/local"
@@ -61,6 +62,7 @@ func main() {
 		fmt.Fprintf(os.Stderr, "dev mode: listening on %s\n", ln.Addr())
 	} else {
 		srv = &tsnet.Server{
+			Dir:      filepath.Join(os.Getenv("HOME"), ".config", "tsnet-rogitproxy"),
 			Hostname: *hostname,
 		}
 		defer srv.Close()
