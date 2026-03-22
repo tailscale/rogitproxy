@@ -591,6 +591,40 @@ func TestIntegrationGitHub(t *testing.T) {
 		t.Logf("fetch-noop output:\n%s", out)
 	})
 
+	t.Run("clone-gzip", func(t *testing.T) {
+		// Use a separate proxy that always gzip-compresses POST bodies,
+		// even small ones, to verify GitHub accepts Content-Encoding: gzip.
+		gzLn, err := net.Listen("tcp", "localhost:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		gzProxy := &GitProxy{
+			Backend:              "https://github.com",
+			Logf:                 t.Logf,
+			CompressGzipMinBytes: 1, // always gzip
+		}
+		go gzProxy.Serve(gzLn)
+		t.Cleanup(func() { gzLn.Close() })
+		gzAddr := gzLn.Addr().String()
+
+		dir := t.TempDir()
+		dest := filepath.Join(dir, "repo")
+
+		cmd := exec.Command("git", "clone", "--depth=1",
+			fmt.Sprintf("git://%s/tailscale/rogitproxy.git", gzAddr), dest)
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("git clone (gzip) failed: %v\n%s", err, out)
+		}
+
+		cmd = exec.Command("git", "-C", dest, "log", "--oneline")
+		out, err = cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("git log failed: %v\n%s", err, out)
+		}
+		t.Logf("clone-gzip log:\n%s", out)
+	})
+
 	t.Run("fetch-cross-repo", func(t *testing.T) {
 		dir := t.TempDir()
 		dest := filepath.Join(dir, "repo")

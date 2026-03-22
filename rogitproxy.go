@@ -13,6 +13,7 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"compress/gzip"
 	"context"
 	"encoding/hex"
 	"encoding/json"
@@ -166,12 +167,13 @@ type Logf func(format string, args ...any)
 // GitProxy proxies git:// protocol connections to an HTTPS or SSH backend.
 // It only permits read-only operations (git-upload-pack).
 type GitProxy struct {
-	Backend       string        // backend URL: "https://github.com" or "ssh://git@github.com"
-	HTTPClient    *http.Client  // optional; defaults to http.DefaultClient
-	LocalClient   *local.Client // optional; if set, used for WhoIs lookups to log caller identity
-	RequireGrants bool          // if true, enforce tailnet grants for repo access
-	Logf          Logf          // optional; defaults to log.Printf
-	ExtraSSHArgs  []string      // optional; extra args passed to ssh before the host (e.g. for tests)
+	Backend              string        // backend URL: "https://github.com" or "ssh://git@github.com"
+	HTTPClient           *http.Client  // optional; defaults to http.DefaultClient
+	LocalClient          *local.Client // optional; if set, used for WhoIs lookups to log caller identity
+	RequireGrants        bool          // if true, enforce tailnet grants for repo access
+	Logf                 Logf          // optional; defaults to log.Printf
+	ExtraSSHArgs         []string      // optional; extra args passed to ssh before the host (e.g. for tests)
+	CompressGzipMinBytes int           // min POST body size to gzip; 0 means always, -1 means never, default 1024
 }
 
 func (p *GitProxy) logf(format string, args ...any) {
@@ -204,14 +206,53 @@ func (p *GitProxy) httpGet(ctx context.Context, url string) (*http.Response, err
 
 // httpPost performs an HTTP POST with the given content type and body,
 // setting an explicit Accept header for the same reason as httpGet.
+// The request body is gzip-compressed when larger than 1 KiB (matching
+// git's own threshold), since the negotiation payloads (want/have lines)
+// are repetitive ASCII hex that compresses very well.
 func (p *GitProxy) httpPost(ctx context.Context, url, contentType string, body io.Reader) (*http.Response, error) {
-	req, err := http.NewRequestWithContext(ctx, "POST", url, body)
+	// Buffer the body so we can measure its size and compress it.
+	// Cap at 32 MiB to bound memory usage — a v2 fetch command with
+	// 32768 have lines (the largest negotiation round git sends) is
+	// ~1.6 MiB, so 32 MiB is very generous.
+	const maxPostBody = 32 << 20
+	var raw bytes.Buffer
+	if _, err := io.Copy(&raw, io.LimitReader(body, maxPostBody+1)); err != nil {
+		return nil, err
+	}
+	if raw.Len() > maxPostBody {
+		return nil, fmt.Errorf("POST body too large (%d bytes, max %d)", raw.Len(), maxPostBody)
+	}
+
+	gzipMin := p.CompressGzipMinBytes
+	if gzipMin == 0 {
+		gzipMin = 1024 // default: match git's own threshold
+	}
+
+	var reqBody io.Reader = &raw
+	var contentEncoding string
+	if gzipMin >= 0 && raw.Len() > gzipMin {
+		var compressed bytes.Buffer
+		gz, _ := gzip.NewWriterLevel(&compressed, gzip.BestCompression)
+		if _, err := gz.Write(raw.Bytes()); err != nil {
+			return nil, err
+		}
+		if err := gz.Close(); err != nil {
+			return nil, err
+		}
+		reqBody = &compressed
+		contentEncoding = "gzip"
+	}
+
+	req, err := http.NewRequestWithContext(ctx, "POST", url, reqBody)
 	if err != nil {
 		return nil, err
 	}
 	req.Header.Set("Content-Type", contentType)
 	req.Header.Set("Accept", "application/x-git-upload-pack-result")
 	req.Header.Set("Git-Protocol", "version=2")
+	if contentEncoding != "" {
+		req.Header.Set("Content-Encoding", contentEncoding)
+	}
 	return p.httpClient().Do(req)
 }
 
