@@ -96,11 +96,18 @@ func main() {
 		if err != nil {
 			log.Fatalf("github app auth: %v", err)
 		}
+		n, err := tr.discoverAllInstallations(context.Background())
+		if err != nil {
+			log.Fatalf("discoverAllInstallations: %v", err)
+		}
+		if n == 0 {
+			log.Fatalf("no GitHub app installations found")
+		}
 		proxy.HTTPClient = &http.Client{Transport: tr}
 		if srv != nil {
 			proxy.RequireGrants = true
 		}
-		log.Printf("github app auth enabled (app %d, installation %d)", *gitHubAppID, *gitHubInstallationID)
+		log.Printf("github app auth enabled (app %d, %d org installations)", *gitHubAppID, n)
 	}
 
 	// Start HTTP debug/status server.
