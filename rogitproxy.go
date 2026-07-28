@@ -32,6 +32,8 @@ import (
 	"tailscale.com/client/local"
 	"tailscale.com/client/tailscale/apitype"
 	"tailscale.com/ipn"
+	"tailscale.com/ipn/store"
+	_ "tailscale.com/ipn/store/kubestore" // for "kube:" state store support
 	"tailscale.com/tailcfg"
 	"tailscale.com/tsnet"
 	"tailscale.com/tsweb"
@@ -43,6 +45,7 @@ func main() {
 		backend  = flag.String("backend", "https://github.com", "backend git server URL (https://... or ssh://[user@]host[:port])")
 		hostname = flag.String("hostname", "rogitproxy", "tsnet hostname")
 		setecURL = flag.String("setec-url", "", "setec server URL for fetching secrets (e.g. https://secrets.your-tailnet.ts.net)")
+		state    = flag.String("state", "", `tsnet state store (e.g. "kube:rogitproxy-tsstate"); if empty, state is stored in a file under $HOME/.config`)
 	)
 	flag.Parse()
 
@@ -64,6 +67,13 @@ func main() {
 		srv = &tsnet.Server{
 			Dir:      filepath.Join(os.Getenv("HOME"), ".config", "tsnet-rogitproxy"),
 			Hostname: *hostname,
+		}
+		if *state != "" {
+			st, err := store.New(log.Printf, *state)
+			if err != nil {
+				log.Fatalf("store.New: %v", err)
+			}
+			srv.Store = st
 		}
 		defer srv.Close()
 		if err := srv.Start(); err != nil {
