@@ -97,6 +97,7 @@ func main() {
 	_, keyOnDisk := getGitHubAppPrivateKeyFromDisk()
 	useGitHubTokenToBackend := *backend == "https://github.com" && (keyOnDisk || !*dev)
 
+	var apiProxy *APIProxy
 	if useGitHubTokenToBackend {
 		var setecDo func(*http.Request) (*http.Response, error)
 		if srv != nil {
@@ -114,8 +115,11 @@ func main() {
 			log.Fatalf("no GitHub app installations found")
 		}
 		proxy.HTTPClient = &http.Client{Transport: tr}
+		apiProxy = &APIProxy{Token: tr.scopedToken}
 		if srv != nil {
 			proxy.RequireGrants = true
+			apiProxy.RequireGrants = true
+			apiProxy.WhoIs = proxy.LocalClient.WhoIs
 		}
 		log.Printf("github app auth enabled (app %d, %d org installations)", *gitHubAppID, n)
 	}
@@ -124,6 +128,9 @@ func main() {
 	mux := http.NewServeMux()
 	tsweb.Debugger(mux)
 	mux.HandleFunc("/", proxy.serveIndex)
+	if apiProxy != nil {
+		apiProxy.Register(mux)
+	}
 
 	if *dev {
 		httpLn, err := net.Listen("tcp", "localhost:0")
@@ -138,6 +145,14 @@ func main() {
 			log.Fatalf("listen :80: %v", err)
 		}
 		go http.Serve(httpLn, mux)
+
+		// Also serve HTTPS with the tailnet's TLS cert, as the gh CLI
+		// only speaks HTTPS to GitHub Enterprise Server hosts.
+		httpsLn, err := srv.ListenTLS("tcp", ":443")
+		if err != nil {
+			log.Fatalf("listen :443: %v", err)
+		}
+		go http.Serve(httpsLn, mux)
 	}
 
 	log.Fatal(proxy.Serve(ln))
@@ -326,7 +341,7 @@ func (p *GitProxy) handleConn(conn net.Conn) {
 	counterNumRequests.Add(1)
 
 	who := p.whoIs(conn)
-	whoStr := formatWhoIs(conn, who)
+	whoStr := formatWhoIs(conn.RemoteAddr().String(), who)
 
 	if p.RequireGrants {
 		if who == nil {
@@ -377,9 +392,8 @@ func (p *GitProxy) whoIs(conn net.Conn) *apitype.WhoIsResponse {
 	return who
 }
 
-// formatWhoIs returns a human-readable string for the peer.
-func formatWhoIs(conn net.Conn, who *apitype.WhoIsResponse) string {
-	addr := conn.RemoteAddr().String()
+// formatWhoIs returns a human-readable string for the peer at addr.
+func formatWhoIs(addr string, who *apitype.WhoIsResponse) string {
 	if who == nil {
 		return addr
 	}
@@ -417,6 +431,23 @@ func checkGrant(who *apitype.WhoIsResponse, repo string, access AccessType) bool
 		}
 	}
 	return false
+}
+
+// grantedRepos returns all repos (of the form "org/repo") that the
+// peer identified by who has been granted the given access type to.
+func grantedRepos(who *apitype.WhoIsResponse, access AccessType) []string {
+	var repos []string
+	for _, raw := range who.CapMap[grantCap] {
+		var g grantValue
+		if err := json.Unmarshal([]byte(raw), &g); err != nil {
+			continue
+		}
+		if g.Access != access {
+			continue
+		}
+		repos = append(repos, g.Repos...)
+	}
+	return repos
 }
 
 // handleSSH proxies via SSH. Since SSH runs git-upload-pack on the remote,
@@ -768,17 +799,7 @@ func (p *GitProxy) serveIndex(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprintf(w, "Hello, %s\n\n", who.UserProfile.LoginName)
 
 	// Collect all repos the user has pull access to.
-	var repos []string
-	for _, raw := range who.CapMap[grantCap] {
-		var g grantValue
-		if err := json.Unmarshal([]byte(raw), &g); err != nil {
-			continue
-		}
-		if g.Access != AccessPull {
-			continue
-		}
-		repos = append(repos, g.Repos...)
-	}
+	repos := grantedRepos(who, AccessPull)
 
 	if len(repos) == 0 {
 		fmt.Fprintf(w, "You do not currently have access to any repositories through this proxy.\n")
@@ -798,6 +819,16 @@ func (p *GitProxy) serveIndex(w http.ResponseWriter, r *http.Request) {
 	if len(repos) > 0 {
 		fmt.Fprintf(w, "  git clone git://%s/%s.git\n", nodeName, repos[0])
 	}
+
+	fmt.Fprintf(w, "\nRead-only GitHub API access (PRs, issues, checks, Actions logs) for\n")
+	fmt.Fprintf(w, "these repos is available with no credentials, laid out like GitHub\n")
+	fmt.Fprintf(w, "Enterprise Server:\n\n")
+	fmt.Fprintf(w, "  REST:    http://%s/api/v3/repos/%s/...\n", nodeName, repos[0])
+	fmt.Fprintf(w, "  GraphQL: http://%s/api/graphql (queries only)\n", nodeName)
+	fmt.Fprintf(w, "\nTo use the gh CLI (HTTPS; the token value is ignored):\n\n")
+	fmt.Fprintf(w, "  export GH_HOST=%s GH_ENTERPRISE_TOKEN=unused\n", nodeName)
+	fmt.Fprintf(w, "  gh pr checks -R %s/%s 123\n", nodeName, repos[0])
+	fmt.Fprintf(w, "\nInside a git:// checkout from this proxy, -R is not needed.\n")
 }
 
 // --- pkt-line encoding/decoding ---

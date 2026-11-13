@@ -26,3 +26,14 @@ func TestOrgFromPath(t *testing.T) {
 		}
 	}
 }
+
+func TestScopedKey(t *testing.T) {
+	a := scopedKey(42, normalizeRepoNames([]string{"Corp", "tailscale", "corp"}))
+	b := scopedKey(42, normalizeRepoNames([]string{"tailscale", "corp"}))
+	if a != b || a != "42:corp,tailscale" {
+		t.Errorf("keys = %q, %q; want both %q", a, b, "42:corp,tailscale")
+	}
+	if got := scopedKey(42, normalizeRepoNames(nil)); got != "42:" {
+		t.Errorf("unscoped key = %q; want %q", got, "42:")
+	}
+}
