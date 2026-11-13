@@ -422,20 +422,21 @@ func TestSSHRejectPush(t *testing.T) {
 	t.Logf("ssh push rejection: %s", resp)
 }
 
-func TestCheckGrant(t *testing.T) {
-	makeWho := func(grants ...grantValue) *apitype.WhoIsResponse {
-		var raw []tailcfg.RawMessage
-		for _, g := range grants {
-			b, _ := json.Marshal(g)
-			raw = append(raw, tailcfg.RawMessage(b))
-		}
-		return &apitype.WhoIsResponse{
-			Node:        &tailcfg.Node{},
-			UserProfile: &tailcfg.UserProfile{},
-			CapMap:      tailcfg.PeerCapMap{grantCap: raw},
-		}
+// makeWho returns a WhoIsResponse with the given rogitproxy grants.
+func makeWho(grants ...grantValue) *apitype.WhoIsResponse {
+	var raw []tailcfg.RawMessage
+	for _, g := range grants {
+		b, _ := json.Marshal(g)
+		raw = append(raw, tailcfg.RawMessage(b))
 	}
+	return &apitype.WhoIsResponse{
+		Node:        &tailcfg.Node{},
+		UserProfile: &tailcfg.UserProfile{},
+		CapMap:      tailcfg.PeerCapMap{grantCap: raw},
+	}
+}
 
+func TestCheckGrant(t *testing.T) {
 	tests := []struct {
 		name   string
 		who    *apitype.WhoIsResponse

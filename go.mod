@@ -4,7 +4,9 @@ go 1.26.1
 
 require (
 	github.com/bradleyfalzon/ghinstallation/v2 v2.18.0
+	github.com/google/go-github/v84 v84.0.0
 	github.com/tailscale/setec v0.0.0-20260310221408-dcd97e42f251
+	github.com/vektah/gqlparser/v2 v2.5.64
 	golang.org/x/crypto v0.46.0
 	tailscale.com v1.96.1
 )
@@ -38,7 +40,6 @@ require (
 	github.com/golang/groupcache v0.0.0-20241129210726-2c02b8208cf8 // indirect
 	github.com/google/btree v1.1.3 // indirect
 	github.com/google/go-cmp v0.7.0 // indirect
-	github.com/google/go-github/v84 v84.0.0 // indirect
 	github.com/google/go-querystring v1.2.0 // indirect
 	github.com/google/uuid v1.6.0 // indirect
 	github.com/hdevalence/ed25519consensus v0.2.0 // indirect

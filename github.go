@@ -11,11 +11,13 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/bradleyfalzon/ghinstallation/v2"
+	"github.com/google/go-github/v84/github"
 	"github.com/tailscale/setec/client/setec"
 )
 
@@ -52,6 +54,8 @@ func GitHubAppTransport(ctx context.Context, setecURL string, setecDo func(*http
 		base:   http.DefaultTransport,
 		appsTr: appsTr,
 		orgTr:  make(map[string]*ghinstallation.Transport),
+		orgID:  make(map[string]int64),
+		scoped: make(map[string]*ghinstallation.Transport),
 	}
 
 	return mt, nil
@@ -65,8 +69,10 @@ type multiOrgTransport struct {
 	base   http.RoundTripper
 	appsTr *ghinstallation.AppsTransport
 
-	mu    sync.RWMutex
-	orgTr map[string]*ghinstallation.Transport // lowercase org -> transport
+	mu     sync.RWMutex
+	orgTr  map[string]*ghinstallation.Transport // lowercase org -> transport
+	orgID  map[string]int64                     // lowercase org -> installation ID
+	scoped map[string]*ghinstallation.Transport // scopedKey -> read-only scoped transport
 }
 
 func (t *multiOrgTransport) RoundTrip(req *http.Request) (*http.Response, error) {
@@ -119,6 +125,7 @@ func (t *multiOrgTransport) transportForOrg(ctx context.Context, org string) (*g
 	}
 	itr = ghinstallation.NewFromAppsTransport(t.appsTr, installID)
 	t.mu.Lock()
+	t.orgID[org] = installID
 	// Only set if we didn't lose the race
 	if existing, ok := t.orgTr[org]; !ok {
 		t.orgTr[org] = itr
@@ -127,6 +134,101 @@ func (t *multiOrgTransport) transportForOrg(ctx context.Context, org string) (*g
 	}
 	t.mu.Unlock()
 	return itr, nil
+}
+
+// installationIDForOrg returns the GitHub App installation ID for the
+// given lowercase org, discovering it via the GitHub API on cache miss.
+func (t *multiOrgTransport) installationIDForOrg(ctx context.Context, org string) (int64, error) {
+	t.mu.RLock()
+	id, ok := t.orgID[org]
+	t.mu.RUnlock()
+	if ok {
+		return id, nil
+	}
+	id, err := t.findInstallationForOrg(ctx, org)
+	if err != nil {
+		return 0, err
+	}
+	t.mu.Lock()
+	t.orgID[org] = id
+	t.mu.Unlock()
+	return id, nil
+}
+
+// apiReadPermissions are the read-only permissions requested for
+// downscoped installation tokens used by the GitHub API proxy. They
+// cover what a read-only collaborator can see on the website: code,
+// Actions runs and logs, checks, commit statuses, issues, and pull
+// requests (including comments and reviews).
+//
+// The GitHub App itself must have been granted at least these
+// permissions, or token creation fails.
+func apiReadPermissions() *github.InstallationPermissions {
+	read := github.Ptr("read")
+	return &github.InstallationPermissions{
+		Actions:      read,
+		Checks:       read,
+		Contents:     read,
+		Issues:       read,
+		Metadata:     read,
+		PullRequests: read,
+		Statuses:     read,
+	}
+}
+
+// scopedToken returns a GitHub App installation token for the given
+// lowercase org that has only read-only permissions (see
+// apiReadPermissions) and, if repos is non-empty, can only access the
+// named repos (bare repo names without the org prefix).
+//
+// Tokens are cached and refreshed by ghinstallation per distinct
+// (installation, repo set) pair.
+func (t *multiOrgTransport) scopedToken(ctx context.Context, org string, repos []string) (string, error) {
+	installID, err := t.installationIDForOrg(ctx, org)
+	if err != nil {
+		return "", err
+	}
+	repos = normalizeRepoNames(repos)
+	key := scopedKey(installID, repos)
+
+	t.mu.RLock()
+	itr, ok := t.scoped[key]
+	t.mu.RUnlock()
+	if !ok {
+		itr = ghinstallation.NewFromAppsTransport(t.appsTr, installID)
+		itr.InstallationTokenOptions = &github.InstallationTokenOptions{
+			Repositories: repos,
+			Permissions:  apiReadPermissions(),
+		}
+		t.mu.Lock()
+		if existing, ok := t.scoped[key]; ok {
+			itr = existing
+		} else {
+			t.scoped[key] = itr
+		}
+		t.mu.Unlock()
+	}
+	return itr.Token(ctx)
+}
+
+// normalizeRepoNames returns a sorted, deduplicated, lowercased copy
+// of repos.
+func normalizeRepoNames(repos []string) []string {
+	if len(repos) == 0 {
+		return nil
+	}
+	ret := make([]string, len(repos))
+	for i, r := range repos {
+		ret[i] = strings.ToLower(r)
+	}
+	slices.Sort(ret)
+	return slices.Compact(ret)
+}
+
+// scopedKey returns the scoped token cache key for the given
+// installation ID and normalized repo names.
+func scopedKey(installID int64, repos []string) string {
+	return fmt.Sprintf("%d:%s", installID, strings.Join(repos, ","))
 }
 
 // findInstallationForOrg calls GET /orgs/{org}/installation using the
@@ -203,6 +305,7 @@ func (t *multiOrgTransport) discoverAllInstallations(ctx context.Context) (int, 
 
 		t.mu.Lock()
 		t.orgTr[org] = itr
+		t.orgID[org] = inst.ID
 		t.mu.Unlock()
 	}
 	return len(installations), nil
