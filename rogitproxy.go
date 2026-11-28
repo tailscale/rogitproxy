@@ -666,7 +666,7 @@ func forwardV2Response(dst io.Writer, src *bufio.Reader) (v2ResponseInfo, error)
 	for {
 		var hdr [4]byte
 		if _, err := io.ReadFull(src, hdr[:]); err != nil {
-			if err == io.EOF || err == io.ErrUnexpectedEOF {
+			if err == io.EOF {
 				return info, nil // clean end of response
 			}
 			return info, err

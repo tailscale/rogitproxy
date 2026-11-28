@@ -4,9 +4,12 @@
 package main
 
 import (
+	"bufio"
+	"bytes"
 	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/http/cgi"
@@ -15,10 +18,40 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"testing/iotest"
 
 	"tailscale.com/client/tailscale/apitype"
 	"tailscale.com/tailcfg"
 )
+
+func TestForwardV2ResponseTruncated(t *testing.T) {
+	const pkt = "0008NAK\n"
+	tests := []struct {
+		name    string
+		src     io.Reader
+		want    string
+		wantErr error
+	}{
+		{"packet then EOF", strings.NewReader(pkt), pkt, nil},
+		{"response-end", strings.NewReader(pkt + "0002"), pkt, nil},
+		{"partial header", strings.NewReader(pkt + "00"), pkt, io.ErrUnexpectedEOF},
+		// net/http reports a body that ends before its Content-Length as
+		// io.ErrUnexpectedEOF, which can land exactly on a packet boundary.
+		{"body cut short", io.MultiReader(strings.NewReader(pkt), iotest.ErrReader(io.ErrUnexpectedEOF)), pkt, io.ErrUnexpectedEOF},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var dst bytes.Buffer
+			_, err := forwardV2Response(&dst, bufio.NewReader(tt.src))
+			if err != tt.wantErr {
+				t.Errorf("err = %v, want %v", err, tt.wantErr)
+			}
+			if got := dst.String(); got != tt.want {
+				t.Errorf("forwarded %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
 
 // startGitHTTPBackend creates a bare git repo with a few commits and
 // serves it over HTTP using git-http-backend. It returns the HTTP
